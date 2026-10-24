@@ -1,6 +1,6 @@
 {
   "name": "gladys-salda-smarty",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Gladys Assistant external integration for Salda Smarty heat recovery ventilation over local Modbus TCP: temperatures, mode, fan speeds, filter, alarms and boost; optional mode and boost commands. Unofficial, not affiliated with Salda.",
   "type": "module",

@@ -10,6 +10,8 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-24
+
 ### Added
 
 - Salda Smarty heat recovery ventilation over local Modbus TCP: supply,
@@ -21,3 +23,6 @@ the notes of the version's GitHub Release.
   critical or fire alarm, and when the unit's versions changed; "Stop the
   boost" never depends on the option (the guide lists when it can fail).
 - "Test the connection" button, docs in English and French, cover image.
+
+[Unreleased]: https://github.com/LM1LC3N7/gladys-salda-smarty/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/LM1LC3N7/gladys-salda-smarty/releases/tag/v0.1.1
