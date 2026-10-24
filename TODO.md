@@ -21,6 +21,12 @@ up to date at the end of every milestone.
       select and boost buttons behind `allow_commands` (off), "Stop the
       boost" never held back by the option, test button, docs en/fr, cover.
       Tested against a fake unit only.
+- [x] **Review r1 fixes** (2026-10-24): sticky boost stop guard (1), stop
+      sequence states refused (2), manifest and CHANGELOG wording (3, 4),
+      Modbus exceptions 4+ "sent, without confirmation" (5), stop retried
+      after a closed connection (6), versions fingerprint (7), invalid
+      address never shown (8), docs (9, 10), stand-by status (11). Tests
+      named `r1-…` in `test/app.test.js`.
 - [ ] **Milestone 2 — real unit**: run against a real Smarty (see "To check").
 - [ ] **Milestone 3 — more**: filter timer reset (coil 1) and alarm reset
       (holding 202) as buttons behind the option, if a real unit shows how
@@ -56,9 +62,14 @@ up to date at the end of every milestone.
   rule, lesson 26).
 - **Identity (FROZEN RULE)**: the Modbus map gives no serial number, so the
   device is `salda-smarty:unit`, one per integration, never the IP address.
-  Consequence, documented: identity cannot be checked before a command
-  (another unit at the same address would receive them; a DHCP reservation
-  is recommended); plausibility checks only (sizes, ranges, known values).
+  A light fingerprint replaces it (review r1, 7): the software and
+  configuration versions (inputs 2 and 3, read in the inputs block), learnt
+  at the first read and kept in `/data` with the unit key (address and unit
+  id). Other versions read (at a poll or in a command's fresh read): the
+  status says so, the mode and boost start are refused; "Test the
+  connection" accepts exactly the versions shown, without a read. An
+  unreadable value is never "another unit". The boost stop never checks it.
+  Two units with the same versions are not told apart (documented).
 - **One Modbus connection at a time** (`useLine`): a poll is one session of
   four requests, closed after; a command aborts a running poll (nothing of
   it is applied) and opens its own session; "Stop the boost" aborts
@@ -72,22 +83,33 @@ up to date at the end of every milestone.
   off by default, a list value, never a switch).
 - **Stopped unit (lesson 26)**: the mode and the boost start may start the
   fans, so they are refused when the fresh read shows stand-by in holding 1,
-  input 15 (current mode) or input 1 (state), or a critical or fire alarm
-  state. An unreadable mode, state or current mode refuses them too. The
+  input 15 (current mode) or input 1 (state), the stop sequence in input 1
+  (cooling heaters 8, closing dampers 9; review r1, 2), or a critical or
+  fire alarm state. Alarm A (holding 200) alone does not refuse them
+  (documented as such). The status says stand-by on any of the three. An unreadable mode, state or current mode refuses them too. The
   boost stop is never checked.
 - **Protective command**: only "Stop the boost" (coil 5 off). Not behind the
   option; one write, no fresh read; a refused connection is tried again
   every 250 ms until 3.5 s after the press; confirmed by the echo and the
-  coil read back; when not confirmed or not sent, a guard of 2 minutes
-  resends it (twice at most, a second after the read that saw the boost on)
-  unless a boost start left after it (set in `beforeSend`; a start refused by
-  the unit with a Modbus exception does not count). A second press joins
-  the first.
+  coil read back; a closed connection, a timeout or a wrong answer is tried
+  again every 250 ms until 3.5 s (idempotent write; review r1, 6). When not
+  confirmed or not sent, a guard of 2 minutes resends it (three times at
+  most, a second after the read that saw the boost on) unless a boost start
+  left after it (set in `beforeSend`, where the stop guard is lifted; a
+  start refused with exception 1-3 does not count). **Sticky guard** (review
+  r1, 1, lesson 17): when a boost start was written and not confirmed (or
+  its guard is up) at the press, the stop guard is kept even when the stop
+  is confirmed, never lifted by a read showing the boost off (by the time
+  only, 2 minutes), with follow-up reads, three resends at most, kept in
+  `/data` and taken back at a start for the same address and unit id. A
+  second press joins the first.
 - **Deadlines**: connection 2 s max, each fresh read 1.5 s max, write by
   3.5 s after the click (checked right before the bytes), read back until
   4.3 s. The written flag is set in `beforeSend`: a write cut afterwards is
-  always "sent, without confirmation"; a Modbus exception to a write is
-  "refused by the unit" (not applied, no guard).
+  always "sent, without confirmation"; a Modbus exception 1-3 to a write is
+  "refused by the unit" (not applied, no guard); any other code (4 device
+  failure, 5 acknowledge, 6 busy) is "sent, without confirmation" with a
+  guard, and a boost start answered so counts as sent (review r1, 5).
 - **Clocks**: deadlines, guards and the time of the last read in memory use a
   monotonic clock (`performance.now()`); the wall clock only for `/data`.
 - **Reads**: values not read this time are left out (never republished as
@@ -106,7 +128,10 @@ up to date at the end of every milestone.
   invalid, nothing is read, the status says why); interval 30 s – 1 h.
 - **No 429/5xx** (raw TCP): failures back off 30 s, 1, 2, 5 min, never under
   the interval. No credentials, nothing secret: `/data` holds only the time
-  of the last read (written at most once a minute, before the read).
+  of the last read (written at most once a minute, before the read), the
+  versions fingerprint of the unit and a sticky boost stop guard (2 minutes
+  at most). An invalid address is never shown again, only its length
+  (review r1, 8).
 - **Units**: °C; filter days on `duration/integer` in days; fan speeds in
   rpm are `unknown` integer sensors (no rpm unit in the core). Texts (current
   mode, state) are stable English keys on read-only `text/text` features.

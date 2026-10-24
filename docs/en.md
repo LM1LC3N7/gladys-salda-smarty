@@ -44,8 +44,14 @@ mode" and in the status, never in the list.
 The unit is read every 60 s (30 s to 1 h), in four requests over one
 connection, closed after. The test button, a Discovery scan, a reconnection
 of Gladys or a restart of the integration never read it sooner than the
-interval. One exception: after a command that was not confirmed, the unit is
-read 5 s and 20 s later to check its effect.
+interval. Reads outside the interval:
+
+- every command reads the unit just before writing, then reads the value
+  written back;
+- "Stop the boost" and its resends;
+- 5 s and 20 s after a command not confirmed, or after a boost stop that
+  follows a boost start not confirmed;
+- a new address or unit id saved is read at once.
 
 ## Commands
 
@@ -54,31 +60,54 @@ commands** is on (off by default). No switch: a voice assistant's "turn
 everything off" never reaches the ventilation.
 
 - Every command reads the unit again just before writing (the mode, the unit
-  state and the value to change), writes nothing when the value is already
-  right, and is confirmed only when the unit returns the echo of the write
-  and then reads the value asked. A command that may have reached the unit
-  without being confirmed answers "sent, without confirmation": check the
-  unit a few seconds later. A command the unit refuses (Modbus exception)
-  answers "refused" and was not applied. A command that cannot be written
-  within 3.5 s is refused and nothing is sent.
+  state, its versions and the value to change), writes nothing when the
+  value is already right, and is confirmed only when the unit returns the
+  echo of the write and then reads the value asked. A command that may have
+  reached the unit without being confirmed answers "sent, without
+  confirmation": check the unit a few seconds later. A command the unit
+  refuses with Modbus exception 1, 2 or 3 (illegal function, address or
+  value) answers "refused" and was not applied; other exceptions (device
+  failure, busy…) answer "sent, without confirmation". A command that cannot
+  be written within 3.5 s is refused and nothing is sent.
 - **Unit in stand-by** (stopped): changing the mode or starting the boost
   would start it, so they are refused as soon as the mode set, the current
   mode or the state read is stand-by. Gladys neither stops nor restarts the
   unit in this version (stopping a heat recovery unit stops the air
   renewal).
-- **Critical or fire alarm**: changing the mode and "Start the boost" are
-  refused.
+- **Unit stopping** (state "cooling heaters" or "closing dampers", Salda's
+  stop sequence): the same refusals.
+- **Critical or fire alarm** (unit state): changing the mode and "Start the
+  boost" are refused. The "Alarm" feature (alarm A) alone does not block
+  them.
+- **Versions changed**: the integration keeps the software and configuration
+  versions of the unit. When they change (an update, or another device at
+  the same address), the status says so and changing the mode and "Start
+  the boost" are refused until **Test the connection** is pressed, which
+  accepts the versions shown. Unreadable versions block nothing.
 - **Stop the boost** is not subject to the option, another command, a read
-  in progress, stand-by or an alarm; it cancels a command not sent yet. It
-  can still answer without having stopped the boost in these cases: no valid
-  address or unit id in the configuration; a value other than 1; the unit
-  unreachable until 3.5 s after the press ("not sent", or "not sent yet"
-  while it still tries); the unit refusing the write (Modbus exception); the
-  echo or the read back missing or different ("sent, without
-  confirmation"). A second press during the first joins it. When not
-  confirmed, the reads of the next two minutes send it again (twice at most)
-  while the boost stays on; a "Start the boost" sent afterwards wins and is
-  never undone.
+  in progress, stand-by, an alarm or the versions; it cancels a command not
+  sent yet. A refused or closed connection, a missing or wrong answer are
+  tried again every 250 ms until 3.5 s after the press. It can still answer
+  without having stopped the boost in these cases:
+  - no valid address or unit id in the configuration;
+  - a value other than 1;
+  - the unit unreachable until 3.5 s after the press ("not sent", or "not
+    sent yet" while it still tries);
+  - the unit refusing the write (Modbus exception 1 to 3: "refused");
+  - the echo or the read back missing or different, another Modbus
+    exception, or the boost read still on ("sent, without confirmation");
+  - another address or unit id saved during the stop: it is interrupted
+    ("sent, without confirmation" if it had left) and its resends are
+    dropped.
+
+  A second press during the first joins it. When not confirmed, the reads of
+  the next two minutes send it again (three times at most) while the boost
+  stays on; a "Start the boost" sent afterwards wins and is never undone.
+  After a "Start the boost" sent but not confirmed, that start may still be
+  applied after the stop: the stop is then watched for two minutes even when
+  confirmed (reads at 5 s and 20 s, resent when the boost reads on, three
+  times at most), and this watch survives a restart of the integration.
+
 - The Smarty limits the boost duration itself.
 
 ## Limits
@@ -86,16 +115,20 @@ everything off" never reaches the ventilation.
 - Only the registers Salda publishes and pysmarty2 uses are read and written
   (no filter timer reset nor alarm reset in this version).
 - The Smarty's Modbus map gives no serial number: the integration shows one
-  unit, the one at the address entered. Changing the address keeps the
-  device and its history; another unit put at the same address would show on
-  the same device and receive its commands too. Reserve the address in your
-  router (fixed DHCP lease).
+  unit, the one at the address entered, and only checks its versions (see
+  above), which two units may share. Changing the address keeps the device
+  and its history; another unit with the same versions put at the same
+  address would show on the same device and receive its commands too.
+  Reserve the address in your router (fixed DHCP lease).
 - Temperatures are read as signed values (tenths of a degree); a value
   outside -60 to 90 °C is ignored.
 - Gladys opens only one Modbus connection at a time to the unit; another
   home automation system polling it meanwhile may slow its answers.
+- An invalid address is never shown again in the status: only its number of
+  characters.
 
 ## Privacy
 
-Nothing leaves your network. The integration only keeps the time of its last
-read in its `/data` volume.
+Nothing leaves your network. The integration only keeps in its `/data`
+volume the time of its last read, the versions of the unit and, for two
+minutes at most, the watch of a boost stop.

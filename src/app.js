@@ -30,12 +30,16 @@
 //   - written within 3.5 s of the click or refused unsent; confirmed only by
 //     the echo of the write and a read back equal to the value asked, by
 //     4.3 s; else "sent, without confirmation" and spaced reads; a Modbus
-//     exception is "refused by the unit"; never retried; one at a time;
+//     exception 1-3 is "refused by the unit", any other code "sent, without
+//     confirmation"; never retried; one at a time; refused when the unit's
+//     versions differ from those learnt (light identity);
 //   - the ack never waits for a publication to Gladys.
 // "Stop the boost" protects: never held back by the option, another command,
-// a failed read or a backoff (one try); possible before the first read after
-// a restart; cancels a command not written yet; reaffirmed (twice at most) by
-// the reads of the next two minutes when it was not confirmed.
+// a failed read, a backoff or the versions; tried again until 3.5 s after the
+// press (idempotent write); possible before the first read after a restart;
+// cancels a command not written yet; reaffirmed (three times at most) by the
+// reads of the next two minutes when it was not confirmed, or, after a boost
+// start not confirmed, even when confirmed (sticky guard, kept in /data).
 //
 // In-memory times (deadlines, guards, the time of the last read) are on a
 // monotonic clock (`clock`); the wall clock (`now`) only for /data.
@@ -46,6 +50,8 @@ import { addressKey, normalizeConfig } from './config.js';
 import {
   ALARM_STATES,
   BLOCKS,
+  NOT_APPLIED_EXCEPTIONS,
+  STOPPING_STATES,
   BLOCK_OF,
   COMMANDS,
   FEATURES,
@@ -123,6 +129,10 @@ export class SaldaSmartyApp {
     this.lastSentAt = -Infinity;
     /** When the last boost start left (and was not refused by the unit). */
     this.lastBoostStartAt = -Infinity;
+    /** A boost start written and not confirmed yet: a boost stop after it gets a sticky guard. */
+    this.boostStartOpen = false;
+    /** The versions read when they differ from those kept for this unit (commands refused). */
+    this.mismatch = undefined;
     /** Value key -> { from, expected, moved, until }: a command sent, not seen yet. */
     this.guards = new Map();
     /** A boost stop not confirmed: { sentAt, until, reasserts }. */
@@ -162,6 +172,8 @@ export class SaldaSmartyApp {
       return;
     }
     this.unit = freshUnit();
+    this.mismatch = undefined;
+    this.restoreStopGuard();
     this.timeouts.clear();
     this.skipped.clear();
     this.published = undefined;
@@ -184,6 +196,48 @@ export class SaldaSmartyApp {
       return;
     }
     await this.tick();
+  }
+
+  /** The unit of the configuration, as kept in /data: its address and Modbus unit id. */
+  unitKey() {
+    return this.config.address ? `${addressKey(this.config.address)}#${this.config.unitId}` : '';
+  }
+
+  /** A sticky boost stop guard kept in /data for this same unit is taken back after a restart. */
+  restoreStopGuard() {
+    const kept = this.memory.stopGuard;
+    if (!kept || kept.unit !== this.unitKey()) {
+      return;
+    }
+    const left = kept.until - this.now();
+    if (left <= 0) {
+      return;
+    }
+    this.stopGuard = {
+      sentAt: this.mono(),
+      until: this.mono() + Math.min(left, TIMINGS.stopGuard),
+      reasserts: kept.reasserts,
+      sticky: true,
+    };
+    this.logger.info('Salda Smarty: a boost stop guard kept in /data is still running');
+  }
+
+  /** Keeps the sticky boost stop guard in /data (or clears it): a restart takes it back. */
+  persistStopGuard() {
+    const guard = this.stopGuard;
+    const next =
+      guard?.sticky && this.mono() < guard.until && this.unitKey()
+        ? {
+            unit: this.unitKey(),
+            until: this.now() + (guard.until - this.mono()),
+            reasserts: guard.reasserts,
+          }
+        : null;
+    if (JSON.stringify(next) === JSON.stringify(this.memory.stopGuard ?? null)) {
+      return;
+    }
+    this.memory.stopGuard = next;
+    this.saveMemory().catch(() => {});
   }
 
   /** The wait before the first read after a container start, from the time kept in /data. */
@@ -579,7 +633,39 @@ export class SaldaSmartyApp {
     u.wait = undefined;
     u.error = undefined;
     u.values = values;
+    this.checkIdentity(values);
     this.observe(values);
+  }
+
+  /**
+   * The light identity of the unit: its software and configuration versions
+   * (inputs 2 and 3), learnt at the first read and kept in /data for this
+   * address and unit id. Another one read means another device may answer at
+   * the address: the commands (except the boost stop) are refused until the
+   * test button accepts it. An unreadable value is never "another unit".
+   */
+  checkIdentity(values) {
+    const seen = values.fingerprint;
+    if (seen === undefined) {
+      return;
+    }
+    const kept = this.memory.identity;
+    if (!kept || kept.unit !== this.unitKey()) {
+      this.memory.identity = { unit: this.unitKey(), fingerprint: seen };
+      this.mismatch = undefined;
+      this.saveMemory().catch(() => {});
+      return;
+    }
+    if (kept.fingerprint === seen) {
+      this.mismatch = undefined;
+      return;
+    }
+    if (this.mismatch !== seen) {
+      this.logger.warn(
+        `Salda Smarty: software/configuration versions changed (${kept.fingerprint} -> ${seen}); commands refused until the test button accepts the unit`,
+      );
+    }
+    this.mismatch = seen;
   }
 
   /** A failed read: the delay before the next one. */
@@ -611,6 +697,9 @@ export class SaldaSmartyApp {
       return [ERROR_KINDS.UNREACHABLE, ERROR_KINDS.TIMEOUT, ERROR_KINDS.CLOSED].includes(u.error)
         ? T.unreachable(addressKey(c.address), wait)
         : T.failing(u.error ?? 'error', wait);
+    }
+    if (u.online === true && this.mismatch !== undefined) {
+      return T.otherUnit(this.memory.identity?.fingerprint ?? '?', this.mismatch);
     }
     if (u.online === undefined) {
       return u.timer && this.due > this.mono()
@@ -750,6 +839,16 @@ export class SaldaSmartyApp {
   async testConnection() {
     if (!this.config.address) {
       return this.status();
+    }
+    if (this.mismatch !== undefined) {
+      // Accepts exactly the versions shown in the status, without a read.
+      const accepted = this.mismatch;
+      this.memory.identity = { unit: this.unitKey(), fingerprint: accepted };
+      this.mismatch = undefined;
+      await this.saveMemory();
+      this.logger.info(`Salda Smarty: unit accepted with versions ${accepted}`);
+      await this.updateStatus();
+      return T.accepted(accepted);
     }
     const u = this.unit;
     const current = () => JSON.parse(this.lastStatus ?? '[false,null]')[1] ?? this.status();
@@ -960,6 +1059,11 @@ export class SaldaSmartyApp {
       }
     }
     check();
+    // The light identity read in the same session: another unit refuses the command.
+    this.checkIdentity(fresh);
+    if (this.mismatch !== undefined) {
+      throw this.refusal(ERRORS.otherUnit);
+    }
     // A fresh read of a command never reaffirms a boost stop.
     this.noteValues(fresh, { fromCommand: true });
     if (command.needsRunning) {
@@ -967,13 +1071,12 @@ export class SaldaSmartyApp {
       if (fresh.mode === 'standby' || fresh.systemMode === 'standby' || fresh.state === 'standby') {
         throw this.refusal(ERRORS.unitStandby);
       }
+      if (STOPPING_STATES.has(fresh.state)) {
+        throw this.refusal(ERRORS.unitStopping);
+      }
       if (ALARM_STATES.has(fresh.state)) {
         throw this.refusal(ERRORS.unitAlarm);
       }
-    }
-    if (plan.role === FEATURES.BOOST_START) {
-      // A boost start decided is the latest wish: an older boost stop is never reaffirmed after it.
-      this.stopGuard = undefined;
     }
     state.from = fresh[command.read];
     if (state.from === plan.expected && !this.guardActive(command.read)) {
@@ -984,6 +1087,7 @@ export class SaldaSmartyApp {
     this.logger.info(`Salda Smarty: ${plan.role} (${plan.written})`);
     const request = writeRequest(command.write, plan.written);
     const previousBoostStart = this.lastBoostStartAt;
+    const previousOpen = this.boostStartOpen;
     let echo;
     try {
       echo = await session.request(request, {
@@ -995,15 +1099,23 @@ export class SaldaSmartyApp {
           state.written = true;
           this.lastSentAt = this.mono();
           if (plan.role === FEATURES.BOOST_START) {
+            // The latest wish, lifted right before its synchronous write: an older
+            // boost stop is never reaffirmed after it (lesson 17).
             this.lastBoostStartAt = this.mono();
+            this.boostStartOpen = true;
+            this.stopGuard = undefined;
+            this.persistStopGuard();
           }
         },
       });
     } catch (err) {
-      if (err.kind === ERROR_KINDS.REFUSED) {
-        // Refused by the unit: not applied, and never counts as the latest boost start.
+      if (err.kind === ERROR_KINDS.REFUSED && NOT_APPLIED_EXCEPTIONS.has(err.code)) {
+        // Refused by the unit (illegal function, address or value): not applied,
+        // and never counts as the latest boost start. Other exception codes
+        // (device failure, acknowledge, busy) may be applied: "sent, without confirmation".
         state.refused = true;
         this.lastBoostStartAt = previousBoostStart;
+        this.boostStartOpen = previousOpen;
       }
       throw err;
     }
@@ -1026,6 +1138,9 @@ export class SaldaSmartyApp {
       throw new ModbusError(ERROR_KINDS.PROTOCOL, 'read back differs', { sent: true });
     }
     this.guards.delete(command.read);
+    if (plan.role === FEATURES.BOOST_START) {
+      this.boostStartOpen = false;
+    }
     this.noteValues({ [command.read]: back });
     this.logger.info(`Salda Smarty: ${plan.role} confirmed by the unit`);
   }
@@ -1059,41 +1174,68 @@ export class SaldaSmartyApp {
   async sendStop(plan, received) {
     // A command not written yet gives way (checked right before its write).
     this.protectSeq += 1;
+    const generation = this.generation;
+    // A boost start that may have left before this stop and is not confirmed
+    // may still be applied after it (a request on an older connection): the
+    // guard of this stop is then sticky, lifted by the time only (lesson 17).
+    const sticky =
+      this.boostStartOpen ||
+      (this.guardActive('boost') && this.guards.get('boost').expected === true) ||
+      Boolean(this.stopGuard?.sticky && this.mono() < this.stopGuard.until);
     const state = { written: false, sentAt: undefined };
+    const retryUntil = received + TIMINGS.commandSendBy;
+    // Writing the coil off is idempotent: a connection closed, a timeout or a
+    // wrong answer is tried again every 250 ms until 3.5 s after the press.
+    const attempt = (session) =>
+      (async () => {
+        const request = writeRequest(plan.command.write, plan.written);
+        const echo = await session.request(request, {
+          timeoutMs: Math.max(250, Math.min(TIMINGS.requestTimeout, retryUntil - this.mono())),
+          beforeSend: () => {
+            state.written = true;
+            state.sentAt = this.mono();
+            this.lastSentAt = this.mono();
+            // The stop now carries a start not confirmed (its sticky guard).
+            this.boostStartOpen = false;
+          },
+        });
+        if (!isEcho(request, echo)) {
+          session.fail(new ModbusError(ERROR_KINDS.PROTOCOL, 'not the echo of the write'));
+          throw new ModbusError(ERROR_KINDS.PROTOCOL, 'not the echo of the write', {
+            sent: true,
+          });
+        }
+        return (await this.readBlock(session, VALUE_BLOCK[plan.command.read]))[plan.command.read];
+      })();
+    const AGAIN = [ERROR_KINDS.CLOSED, ERROR_KINDS.TIMEOUT, ERROR_KINDS.PROTOCOL];
     this.reserved += 1;
     const sending = (async () => {
       try {
         await this.takeLine(['read', 'command', 'protect']);
-        const retryUntil = received + TIMINGS.commandSendBy;
-        return await this.useLine(
-          'protect',
-          TIMINGS.connectTimeout,
-          async (session) => {
-            const request = writeRequest(plan.command.write, plan.written);
-            const echo = await session.request(request, {
-              beforeSend: () => {
-                state.written = true;
-                state.sentAt = this.mono();
-                this.lastSentAt = this.mono();
-              },
-            });
-            if (!isEcho(request, echo)) {
-              session.fail(new ModbusError(ERROR_KINDS.PROTOCOL, 'not the echo of the write'));
-              throw new ModbusError(ERROR_KINDS.PROTOCOL, 'not the echo of the write', {
-                sent: true,
-              });
+        for (;;) {
+          try {
+            return await this.useLine('protect', TIMINGS.connectTimeout, attempt, { retryUntil });
+          } catch (err) {
+            const again =
+              AGAIN.includes(err?.kind) &&
+              generation === this.generation &&
+              this.mono() + TIMINGS.connectRetry < retryUntil;
+            if (!again) {
+              throw err;
             }
-            return (await this.readBlock(session, VALUE_BLOCK[plan.command.read]))[
-              plan.command.read
-            ];
-          },
-          { retryUntil },
-        );
+            await new Promise((resolve) => this.timers.setTimeout(resolve, TIMINGS.connectRetry));
+            if (generation !== this.generation) {
+              throw err;
+            }
+          }
+        }
       } finally {
         this.reserved -= 1;
       }
     })();
-    this.logger.info('Salda Smarty: boost stop');
+    this.logger.info(
+      `Salda Smarty: boost stop${sticky ? ' (after a boost start not confirmed)' : ''}`,
+    );
     const answerIn = Math.max(0, received + TIMINGS.commandAnswerBy - this.mono());
     let late;
     const outcome = await new Promise((resolve) => {
@@ -1106,13 +1248,20 @@ export class SaldaSmartyApp {
     this.timers.clearTimeout(late);
     if (outcome.back === plan.expected) {
       this.guards.delete(plan.command.read);
-      this.stopGuard = undefined;
+      if (sticky) {
+        // Confirmed now, but the start may still land: reads and resends for 2 minutes.
+        this.keepStopGuard(state.sentAt ?? this.mono(), true);
+        this.followUp();
+      } else {
+        this.stopGuard = undefined;
+        this.persistStopGuard();
+      }
       this.noteValues({ [plan.command.read]: outcome.back });
       this.logger.info('Salda Smarty: boost stop confirmed by the unit');
       return;
     }
     // Not confirmed: the reads of the next two minutes reaffirm it.
-    this.keepStopGuard(state.sentAt ?? this.mono());
+    this.keepStopGuard(state.sentAt ?? this.mono(), sticky);
     this.followUp();
     if (outcome.late) {
       sending.catch((err) =>
@@ -1133,7 +1282,10 @@ export class SaldaSmartyApp {
       if (!state.written) {
         throw this.refusal(ERRORS.notSent(reason));
       }
-      if (outcome.err.kind === ERROR_KINDS.REFUSED) {
+      if (
+        outcome.err.kind === ERROR_KINDS.REFUSED &&
+        NOT_APPLIED_EXCEPTIONS.has(outcome.err.code)
+      ) {
         throw this.refusal(ERRORS.refused(reason));
       }
       throw this.refusal(ERRORS.sentUnconfirmed(reason));
@@ -1146,12 +1298,15 @@ export class SaldaSmartyApp {
     );
   }
 
-  keepStopGuard(sentAt) {
+  /** Sets (or extends) the boost stop guard; a sticky one is kept in /data. */
+  keepStopGuard(sentAt, sticky = false) {
     if (this.stopGuard && this.mono() < this.stopGuard.until) {
       this.stopGuard.sentAt = Math.max(this.stopGuard.sentAt, sentAt);
-      return;
+      this.stopGuard.sticky = this.stopGuard.sticky || sticky;
+    } else {
+      this.stopGuard = { sentAt, until: this.mono() + TIMINGS.stopGuard, reasserts: 0, sticky };
     }
-    this.stopGuard = { sentAt, until: this.mono() + TIMINGS.stopGuard, reasserts: 0 };
+    this.persistStopGuard();
   }
 
   // --- Guards --------------------------------------------------------------------
@@ -1168,8 +1323,9 @@ export class SaldaSmartyApp {
   /**
    * A read through the guards: a guard lifts when the value moved from the
    * start state to the one asked (never on an unknown value); a boost stop
-   * not confirmed is sent again when the boost shows on and no boost start
-   * left after it.
+   * not confirmed is sent again (three times at most) when the boost shows on
+   * and no boost start left after it. A sticky stop guard (a start may still
+   * land after the stop) is lifted by the time only, never by a read.
    */
   observe(values, { fromCommand = false } = {}) {
     for (const key of [...this.guards.keys()]) {
@@ -1190,10 +1346,14 @@ export class SaldaSmartyApp {
     }
     if (this.mono() >= stop.until || this.lastBoostStartAt > stop.sentAt) {
       this.stopGuard = undefined;
+      this.persistStopGuard();
       return;
     }
     if (values.boost === false) {
-      this.stopGuard = undefined;
+      // A sticky guard is lifted by the time only: a start may still land.
+      if (!stop.sticky) {
+        this.stopGuard = undefined;
+      }
       return;
     }
     if (
@@ -1204,6 +1364,7 @@ export class SaldaSmartyApp {
       stop.reasserts < TIMINGS.stopReasserts
     ) {
       stop.reasserts += 1;
+      this.persistStopGuard();
       this.logger.warn('Salda Smarty: the boost is still on after a stop, stop sent again');
       // Not awaited, and a second after the read closed the line.
       const generation = this.generation;

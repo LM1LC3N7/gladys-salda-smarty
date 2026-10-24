@@ -17,5 +17,7 @@ the notes of the version's GitHub Release.
   speeds, filter days left, alarm, warning and boost.
 - Commands behind "Allow the commands" (off by default): the mode (building
   protection, economy, comfort) and "Start the boost", refused on a unit in
-  stand-by or in alarm; "Stop the boost" always allowed.
+  stand-by, stopping (cooling the heaters, closing the dampers), or in
+  critical or fire alarm, and when the unit's versions changed; "Stop the
+  boost" never depends on the option (the guide lists when it can fail).
 - "Test the connection" button, docs in English and French, cover image.

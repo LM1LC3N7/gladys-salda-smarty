@@ -11,7 +11,7 @@ import { createFakeGladys } from '@gladysassistant/integration-sdk/testing';
 import { SaldaSmartyApp } from '../src/app.js';
 import { MINUTE, SECOND } from '../src/constants.js';
 import { registerHandlers } from '../src/handlers.js';
-import { memoryStore } from '../src/store.js';
+import { memoryStore, normalizeMemory } from '../src/store.js';
 import { HOST, NOW, fakeSmarty, settle } from './fixtures/fakeSmarty.js';
 
 const CFG = { host: HOST };
@@ -328,7 +328,7 @@ test('the boost stop goes before the first read after a restart, and says when n
   assert.match(String(ack.error), /non envoyée|pas encore envoyé/);
 });
 
-test('a boost stop not confirmed is reaffirmed by the next reads, twice at most', async (t) => {
+test('a boost stop not confirmed is reaffirmed by the next reads, three times at most', async (t) => {
   const ctx = await setup(t);
   ctx.unit.map.coils.set(5, true);
   ctx.unit.ignoreWrites = true;
@@ -337,7 +337,7 @@ test('a boost stop not confirmed is reaffirmed by the next reads, twice at most'
   assert.match(String(ack.error), /sans confirmation/);
   await ctx.advance(2 * MINUTE, 100);
   const stops = ctx.unit.writes().filter((w) => w.fc === 5 && w.value === 0);
-  assert.equal(stops.length, 3, 'the stop and two reaffirmations');
+  assert.equal(stops.length, 4, 'the stop and three reaffirmations');
   assert.equal(ctx.unit.maxOpen, 1);
 });
 
@@ -458,4 +458,128 @@ test('a boost start refused by the unit never counts as the latest start (lesson
   assert.match(String(ack.error), /a refusé la commande/);
   assert.equal(ctx.app.lastBoostStartAt, before);
   assert.equal(ctx.unit.writes().length, 1);
+});
+
+test('r1-1: a boost start landing after a confirmed stop is stopped again (sticky guard)', async (t) => {
+  const store = memoryStore();
+  const ctx = await setup(t, { config: ALLOW, store });
+  // The start's write reaches the unit 2 s later, on its old connection.
+  ctx.unit.writeDelays = [2000];
+  ctx.unit.applyClosedWrites = true;
+  const start = ctx.fire('boost-start');
+  await ctx.advance(300);
+  const stop = ctx.fire('boost-stop');
+  await ctx.advance(1000, 50);
+  const stopped = await stop;
+  assert.equal(stopped.success, true, String(stopped.error));
+  const started = await start;
+  assert.equal(started.success, false);
+  assert.match(String(started.error), /sans confirmation|arrêté entre-temps/);
+  await ctx.advance(1500, 50);
+  assert.equal(ctx.unit.map.coils.get(5), true, 'the late start landed');
+  assert.ok(store.data.stopGuard, 'the sticky guard is kept in /data');
+  await ctx.advance(30 * SECOND, 100);
+  assert.equal(ctx.unit.map.coils.get(5), false, 'stopped again');
+  const stops = ctx.unit.writes().filter((w) => w.fc === 5 && w.value === 0);
+  assert.ok(stops.length >= 2 && stops.length <= 4, `${stops.length} stops`);
+  // Lifted by the time only.
+  await ctx.advance(2 * MINUTE, 500);
+  assert.equal(ctx.app.stopGuard, undefined);
+  assert.equal(store.data.stopGuard, null);
+});
+
+test('r1-1: a sticky stop guard kept in /data comes back after a restart (same unit only)', async (t) => {
+  const store = memoryStore({
+    stopGuard: { unit: `${HOST}#1`, until: NOW + MINUTE, reasserts: 1 },
+  });
+  const unit = fakeSmarty();
+  unit.map.coils.set(5, true);
+  const ctx = await setup(t, { store, unit });
+  await ctx.advance(3 * SECOND, 50);
+  assert.equal(unit.map.coils.get(5), false, 'reaffirmed after the first read');
+  const other = memoryStore({ stopGuard: { unit: '192.168.1.81#1', until: NOW + MINUTE } });
+  const app = new SaldaSmartyApp({ gladys: ctx.gladys, store: other, now: () => Date.now() });
+  app.config = { address: { host: HOST, port: 502 }, unitId: 1 };
+  app.memory = normalizeMemory(await other.load(), Date.now());
+  app.restoreStopGuard();
+  assert.equal(app.stopGuard, undefined);
+});
+
+test('r1-2: a unit stopping (cooling heaters, closing dampers) is never started', async (t) => {
+  const ctx = await setup(t, { config: ALLOW });
+  for (const code of [8, 9]) {
+    ctx.unit.map.inputs.set(1, code);
+    for (const [role, value] of [
+      ['mode', 'comfort'],
+      ['boost-start', 1],
+    ]) {
+      const ack = await ctx.press(role, value);
+      assert.equal(ack.success, false, `${role} in ${code}`);
+      assert.match(String(ack.error), /en train de s’arrêter/);
+    }
+  }
+  assert.deepEqual(ctx.unit.writes(), []);
+});
+
+test('r1-5: exception 4-6 to a write is "sent, without confirmation" with a guard', async (t) => {
+  const ctx = await setup(t, { config: ALLOW });
+  ctx.unit.exceptions.add('5:5');
+  ctx.unit.exceptionCode = 6;
+  const before = ctx.app.lastBoostStartAt;
+  const ack = await ctx.press('boost-start');
+  assert.equal(ack.success, false);
+  assert.match(String(ack.error), /sans confirmation/);
+  assert.ok(ctx.app.guards.has('boost'));
+  assert.ok(ctx.app.lastBoostStartAt > before, 'counts as a start that left');
+});
+
+test('r1-6: the boost stop is sent again when the unit accepts then closes the connection', async (t) => {
+  const ctx = await setup(t);
+  ctx.unit.map.coils.set(5, true);
+  ctx.unit.dropConnections = 3;
+  const ack = await ctx.press('boost-stop');
+  assert.equal(ack.success, true, String(ack.error));
+  assert.equal(ctx.unit.dropped, 3);
+  assert.ok(ctx.unit.writes().length >= 2, 'tried again');
+  assert.ok(ctx.unit.writes().every((w) => w.fc === 5 && w.value === 0));
+  assert.equal(ctx.unit.map.coils.get(5), false);
+});
+
+test('r1-7: other versions read: commands refused until the test button accepts, stop never', async (t) => {
+  const store = memoryStore();
+  const ctx = await setup(t, { config: ALLOW, store });
+  assert.equal(store.data.identity.fingerprint, '0:0');
+  ctx.unit.map.inputs.set(2, 121);
+  await ctx.advance(MINUTE, 100);
+  assert.match(ctx.gladys.fake.connectionStatus.message.fr, /versions logicielle/);
+  const ack = await ctx.press('mode', 'comfort');
+  assert.equal(ack.success, false);
+  assert.match(String(ack.error), /Tester la connexion/);
+  ctx.unit.map.coils.set(5, true);
+  assert.equal((await ctx.press('boost-stop')).success, true, 'the stop is never blocked');
+  const answer = await ctx.gladys.fake.action('test_connection');
+  assert.match(JSON.stringify(answer), /121:0/);
+  assert.equal(store.data.identity.fingerprint, '121:0');
+  assert.equal((await ctx.press('mode', 'comfort')).success, true);
+});
+
+test('r1-7: unreadable versions are never another unit', async (t) => {
+  const ctx = await setup(t, { config: ALLOW });
+  ctx.unit.exceptions.add('4:1');
+  await ctx.advance(MINUTE, 100);
+  assert.equal(ctx.app.mismatch, undefined);
+});
+
+test('r1-8: an invalid address is never shown again, only its length', async (t) => {
+  const ctx = await setup(t, { config: { host: 'sk-secret-key value' }, create: false });
+  const message = JSON.stringify(ctx.gladys.fake.connectionStatus.message);
+  assert.doesNotMatch(message, /secret/);
+  assert.match(message, /19 caractères/);
+});
+
+test('r1-11: the status says stand-by when the current mode reads it (schedule)', async (t) => {
+  const unit = fakeSmarty();
+  unit.map.inputs.set(15, 0);
+  const ctx = await setup(t, { unit });
+  assert.match(ctx.gladys.fake.connectionStatus.message.fr, /en veille/);
 });

@@ -1,13 +1,15 @@
 // -----------------------------------------------------------------------------
 // What must survive a restart, in /data (the only writable place of the
 // container): the time of the last read of the unit (written at most once a
-// minute, BEFORE the read), so a restart of the container never reads the
-// unit sooner than the interval. No secret (the Modbus interface has none), no personal
-// data. The file is readable by the container user only (0600), bounded and
-// repaired when read back.
+// minute, BEFORE the read), so a restart never reads the unit sooner than the
+// interval; the software/configuration versions of the unit (its light
+// identity); a sticky boost stop guard (2 minutes at most). No secret (the
+// Modbus interface has none), no personal data. The file is readable by the
+// container user only (0600), bounded and repaired when read back.
 // -----------------------------------------------------------------------------
 
 import { readFile, rename, writeFile } from 'node:fs/promises';
+import { TIMINGS } from './constants.js';
 
 export const STATE_FILE = '/data/salda-smarty-state.json';
 
@@ -51,11 +53,41 @@ export function memoryStore(initial = null) {
   };
 }
 
-/** The persisted state, repaired and bounded: `{ lastAttemptAt: number | null }`. */
+/** A short text of printable ASCII, bounded, else undefined. */
+const shortText = (value, max) =>
+  typeof value === 'string' && value.length <= max && /^[\x20-\x7e]*$/.test(value)
+    ? value
+    : undefined;
+
+/**
+ * The persisted state, repaired and bounded:
+ * - `lastAttemptAt`: wall time of the last read, or null;
+ * - `identity`: `{ unit, fingerprint }`, the software and configuration
+ *   versions learnt for the unit `unit` (address and Modbus unit id), or null;
+ * - `stopGuard`: `{ unit, until, reasserts }`, a sticky boost stop guard
+ *   (wall time of its end) for the unit `unit`, or null.
+ */
 export function normalizeMemory(raw, now) {
   const data = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const identity = data.identity && typeof data.identity === 'object' ? data.identity : {};
+  const guard = data.stopGuard && typeof data.stopGuard === 'object' ? data.stopGuard : {};
+  const unit = shortText(identity.unit, 280);
+  const fingerprint = shortText(identity.fingerprint, 32);
+  const guardUnit = shortText(guard.unit, 280);
   return {
     // A time in the future (a clock set back) counts as now: never a longer wait than the interval.
     lastAttemptAt: Number.isFinite(data.lastAttemptAt) ? Math.min(data.lastAttemptAt, now) : null,
+    identity: unit && fingerprint ? { unit, fingerprint } : null,
+    // A guard ends within its longest duration from now, whatever the clock said when it was kept.
+    stopGuard:
+      guardUnit && Number.isFinite(guard.until) && guard.until > now
+        ? {
+            unit: guardUnit,
+            until: Math.min(guard.until, now + TIMINGS.stopGuard),
+            reasserts: Number.isInteger(guard.reasserts)
+              ? Math.min(TIMINGS.stopReasserts, Math.max(0, guard.reasserts))
+              : 0,
+          }
+        : null,
   };
 }

@@ -12,7 +12,7 @@ talking to Gladys through `@gladysassistant/integration-sdk` (v0.15), its only
 runtime dependency (Modbus TCP goes through `node:net`). It reads a Salda
 Smarty ventilation unit over Modbus TCP (port 502, no cloud, no
 authentication) and shows it as one Gladys device; commands behind an
-off-by-default option, "Stop the boost" always allowed. Never tested with a
+off-by-default option, "Stop the boost" never behind that option. Never tested with a
 real device, not affiliated with Salda.
 
 ## Commands
@@ -61,7 +61,8 @@ scripts/cover.mjs         cover.png generator
 - **Commands**: never a switch, a writable binary or a writable fan; refused
   unless `allow_commands` (checked on arrival and in `beforeSend`), except
   `boost-stop`; decided on a fresh read in the same session; refused on a
-  unit in stand-by or in alarm (they would start it); written within 3.5 s;
+  unit in stand-by, stopping or in critical/fire alarm (they would start it),
+  or whose versions changed; written within 3.5 s;
   confirmed only by the echo and a read back equal to the value asked; a
   written command is never "not sent"; never retried; the ack never waits
   for Gladys.

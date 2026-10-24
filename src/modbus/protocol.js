@@ -91,6 +91,10 @@ export function decodeBlock(block, data) {
     case 'inputs': {
       const word = (address) => at(data, block.address, address);
       put('state', SYSTEM_STATES[word(1)]);
+      // The software and configuration versions: a light fingerprint of the unit (no serial).
+      if (Number.isInteger(word(2)) && Number.isInteger(word(3))) {
+        put('fingerprint', `${word(2)}:${word(3)}`);
+      }
       put('systemMode', SYSTEM_MODES[word(15)]);
       put('supply', temperature(word(18)));
       put('extract', temperature(word(19)));

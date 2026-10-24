@@ -92,6 +92,22 @@ export const SYSTEM_STATES = [
 /** System states in which no command that moves air is sent (the unit handles them). */
 export const ALARM_STATES = new Set(['critical-alarm', 'fire-alarm']);
 
+/**
+ * The stop sequence of the unit (Salda: cooling the heaters, then closing the
+ * dampers): a stop from the schedule or an external input may not read as
+ * stand-by yet in holding 1 and input 15; a command that would start the fans
+ * is refused there too.
+ */
+export const STOPPING_STATES = new Set(['cooling-heaters', 'closing-dampers']);
+
+/**
+ * Modbus exception codes that mean the request was not applied (illegal
+ * function, address, value). Any other code (4 device failure, 5 acknowledge,
+ * 6 busy…) may come from a write the unit applies anyway: "sent, without
+ * confirmation".
+ */
+export const NOT_APPLIED_EXCEPTIONS = new Set([1, 2, 3]);
+
 /** Feature roles (the last part of the feature external ids): frozen. */
 export const FEATURES = {
   MODE: 'mode',
@@ -207,7 +223,7 @@ export const TIMINGS = {
   followUps: [5 * SECOND, 20 * SECOND],
   /** A sent command keeps its guard until a read shows what it asked, or 90 s. */
   guard: 90 * SECOND,
-  /** A boost stop not confirmed is reaffirmed by the reads of the next 2 minutes, twice at most. */
+  /** A boost stop not confirmed is reaffirmed by the reads of the next 2 minutes, three times at most. */
   stopGuard: 2 * MINUTE,
-  stopReasserts: 2,
+  stopReasserts: 3,
 };

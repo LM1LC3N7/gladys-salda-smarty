@@ -70,10 +70,20 @@ export const T = {
     'Enter the IP address of your Salda Smarty unit (Modbus TCP), then save.',
     'Saisissez l’adresse IP de votre centrale Salda Smarty (Modbus TCP), puis enregistrez.',
   ),
-  invalid: (typed) =>
+  invalid: (length) =>
     both(
-      `Invalid address: ${typed} (an IPv4 address or a host name, optionally with a port).`,
-      `Adresse invalide : ${typed} (une adresse IPv4 ou un nom d’hôte, avec un port si besoin).`,
+      `Invalid address (${length} characters): an IPv4 address or a host name, optionally with a port.`,
+      `Adresse invalide (${length} caractères) : une adresse IPv4 ou un nom d’hôte, avec un port si besoin.`,
+    ),
+  otherUnit: (kept, seen) =>
+    both(
+      `Connected, but the unit's software/configuration versions changed (${kept} → ${seen}): another device may answer at this address. The mode and boost start commands are refused; if it is your unit (after an update), press "Test the connection" to accept it.`,
+      `Connecté, mais les versions logicielle et de configuration de la centrale ont changé (${kept} → ${seen}) : un autre appareil répond peut-être à cette adresse. Le changement de mode et le démarrage du boost sont refusés ; si c’est bien votre centrale (après une mise à jour), appuyez sur « Tester la connexion » pour l’accepter.`,
+    ),
+  accepted: (seen) =>
+    both(
+      `Unit accepted with the versions ${seen}: the commands follow the option again.`,
+      `Centrale acceptée avec les versions ${seen} : les commandes suivent de nouveau l’option.`,
     ),
   badUnitId: both(
     'Invalid Modbus unit id: a whole number from 1 to 247 (1 on a Smarty unless changed). Nothing is read.',
@@ -98,7 +108,11 @@ export const T = {
       `La centrale a mal répondu (${reason}) ; nouvel essai dans ${wait.fr}.`,
     ),
   summary: (values) => {
-    if (values.mode === 'standby') {
+    if (
+      values.mode === 'standby' ||
+      values.systemMode === 'standby' ||
+      values.state === 'standby'
+    ) {
       return both(
         'Salda Smarty: unit in stand-by (stopped); Gladys does not restart it.',
         'Salda Smarty : centrale en veille (arrêtée) ; Gladys ne la relance pas.',
@@ -130,6 +144,14 @@ export const ERRORS = {
   unitStandby: both(
     'The unit is in stand-by (stopped): this command would start it, and Gladys neither stops nor restarts it. Not sent.',
     'La centrale est en veille (arrêtée) : cette commande la relancerait, et Gladys ne l’arrête ni ne la relance. Non envoyée.',
+  ),
+  unitStopping: both(
+    'The unit is stopping (cooling the heaters or closing the dampers): this command could start it again. Not sent.',
+    'La centrale est en train de s’arrêter (refroidissement des batteries ou fermeture des volets) : cette commande pourrait la relancer. Non envoyée.',
+  ),
+  otherUnit: both(
+    'The software/configuration versions of the unit changed: another device may answer at this address. Press "Test the connection" to accept it. Not sent.',
+    'Les versions logicielle et de configuration de la centrale ont changé : un autre appareil répond peut-être à cette adresse. Appuyez sur « Tester la connexion » pour l’accepter. Non envoyée.',
   ),
   unitAlarm: both(
     'The unit is in critical or fire alarm: no command that moves air is sent. Not sent.',

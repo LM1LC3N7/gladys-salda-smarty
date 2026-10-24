@@ -199,5 +199,5 @@ test('config: addresses, port, unit id (strict), interval', () => {
   assert.equal(normalizeConfig({ poll_interval: '' }).pollInterval, 60);
   assert.equal(normalizeConfig({ poll_interval: 5 }).pollInterval, 30);
   assert.equal(normalizeConfig({ allow_commands: 'yes' }).allowCommands, false);
-  assert.equal(normalizeConfig({ host: 'bad\u0007host' }).invalid, 'bad?host');
+  assert.equal(normalizeConfig({ host: 'bad\u0007host' }).invalid, 8, 'only its length');
 });

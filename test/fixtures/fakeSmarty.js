@@ -77,9 +77,16 @@ export function fakeSmarty({ map = defaultMap(), unitId = 1 } = {}) {
     /** Function codes or "fc:address" keys that never answer, answer an exception, or delays. */
     silent: new Set(),
     exceptions: new Set(),
+    exceptionCode: 2,
     delays: {},
     /** Writes acknowledged but not applied (an unconfirmed command). */
     ignoreWrites: false,
+    /** Delays of the next writes (one each), and writes applied even after their connection closed. */
+    writeDelays: [],
+    applyClosedWrites: false,
+    /** The next connections accepted then closed at once. */
+    dropConnections: 0,
+    dropped: 0,
     /** Answers split in two chunks, or with a wrong transaction id, or a wrong echo. */
     split: false,
     wrongTransaction: false,
@@ -95,53 +102,65 @@ export function fakeSmarty({ map = defaultMap(), unitId = 1 } = {}) {
       unit.log.push(write ? { fc, address, value: arg } : { fc, address, count: arg, uid });
       const key = `${fc}:${address}`;
       if (unit.silent.has(key) || unit.silent.has(fc)) return;
-      setTimeout(() => {
-        if (socket.destroyed) return;
-        let answer;
-        if (unit.exceptions.has(key) || unit.exceptions.has(fc)) {
-          answer = Buffer.from([fc | 0x80, 2]);
-        } else if (fc === 3 || fc === 4) {
-          const table = fc === 3 ? unit.map.holding : unit.map.inputs;
-          answer = Buffer.alloc(2 + arg * 2);
-          answer[0] = fc;
-          answer[1] = arg * 2;
-          for (let i = 0; i < arg; i += 1)
-            answer.writeUInt16BE(table.get(address + i) ?? 0, 2 + i * 2);
-        } else if (fc === 1) {
-          const bytes = Math.ceil(arg / 8);
-          answer = Buffer.alloc(2 + bytes);
-          answer[0] = fc;
-          answer[1] = bytes;
-          for (let i = 0; i < arg; i += 1) {
-            if (unit.map.coils.get(address + i)) answer[2 + (i >> 3)] |= 1 << (i & 7);
-          }
-        } else if (write) {
-          if (!unit.ignoreWrites) {
-            if (fc === 5) unit.map.coils.set(address, arg === 0xff00);
-            else unit.map.holding.set(address, arg);
-            if (fc === 6 && address === 1) {
-              unit.map.inputs.set(15, arg);
-              unit.map.inputs.set(1, arg);
+      const writeDelay =
+        write && unit.writeDelays.length > 0 ? unit.writeDelays.shift() : undefined;
+      setTimeout(
+        () => {
+          if (socket.destroyed) {
+            // A write already in the unit is applied even when its connection is gone.
+            if (write && unit.applyClosedWrites && !unit.ignoreWrites) {
+              if (fc === 5) unit.map.coils.set(address, arg === 0xff00);
+              else unit.map.holding.set(address, arg);
             }
+            return;
           }
-          answer = Buffer.from(pdu);
-          if (unit.badEcho) answer[4] ^= 1;
-        } else {
-          answer = Buffer.from([fc | 0x80, 1]);
-        }
-        const out = Buffer.alloc(7 + answer.length);
-        out.writeUInt16BE(unit.wrongTransaction ? (tid + 1) & 0xffff : tid, 0);
-        out.writeUInt16BE(0, 2);
-        out.writeUInt16BE(answer.length + 1, 4);
-        out[6] = uid;
-        answer.copy(out, 7);
-        if (unit.split) {
-          socket.emit('data', out.subarray(0, 3));
-          socket.emit('data', out.subarray(3));
-        } else {
-          socket.emit('data', out);
-        }
-      }, unit.delays[key] ?? unit.delay);
+          let answer;
+          if (unit.exceptions.has(key) || unit.exceptions.has(fc)) {
+            answer = Buffer.from([fc | 0x80, unit.exceptionCode]);
+          } else if (fc === 3 || fc === 4) {
+            const table = fc === 3 ? unit.map.holding : unit.map.inputs;
+            answer = Buffer.alloc(2 + arg * 2);
+            answer[0] = fc;
+            answer[1] = arg * 2;
+            for (let i = 0; i < arg; i += 1)
+              answer.writeUInt16BE(table.get(address + i) ?? 0, 2 + i * 2);
+          } else if (fc === 1) {
+            const bytes = Math.ceil(arg / 8);
+            answer = Buffer.alloc(2 + bytes);
+            answer[0] = fc;
+            answer[1] = bytes;
+            for (let i = 0; i < arg; i += 1) {
+              if (unit.map.coils.get(address + i)) answer[2 + (i >> 3)] |= 1 << (i & 7);
+            }
+          } else if (write) {
+            if (!unit.ignoreWrites) {
+              if (fc === 5) unit.map.coils.set(address, arg === 0xff00);
+              else unit.map.holding.set(address, arg);
+              if (fc === 6 && address === 1) {
+                unit.map.inputs.set(15, arg);
+                unit.map.inputs.set(1, arg);
+              }
+            }
+            answer = Buffer.from(pdu);
+            if (unit.badEcho) answer[4] ^= 1;
+          } else {
+            answer = Buffer.from([fc | 0x80, 1]);
+          }
+          const out = Buffer.alloc(7 + answer.length);
+          out.writeUInt16BE(unit.wrongTransaction ? (tid + 1) & 0xffff : tid, 0);
+          out.writeUInt16BE(0, 2);
+          out.writeUInt16BE(answer.length + 1, 4);
+          out[6] = uid;
+          answer.copy(out, 7);
+          if (unit.split) {
+            socket.emit('data', out.subarray(0, 3));
+            socket.emit('data', out.subarray(3));
+          } else {
+            socket.emit('data', out);
+          }
+        },
+        writeDelay ?? unit.delays[key] ?? unit.delay,
+      );
     },
     connect() {
       const socket = new FakeSocket(unit);
@@ -151,6 +170,14 @@ export function fakeSmarty({ map = defaultMap(), unitId = 1 } = {}) {
         if (unit.down) {
           unit.refused += 1;
           socket.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+          return;
+        }
+        if (unit.dropConnections > 0) {
+          // Accepted, then closed at once (an embedded server with no place left).
+          unit.dropConnections -= 1;
+          unit.dropped += 1;
+          socket.emit('connect');
+          setImmediate(() => !socket.destroyed && socket.emit('close'));
           return;
         }
         unit.open.add(socket);

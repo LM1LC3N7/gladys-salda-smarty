@@ -56,10 +56,6 @@ export function parseAddress(raw) {
 
 export const addressKey = ({ host, port }) => (port === DEFAULT_PORT ? host : `${host}:${port}`);
 
-/** A text without control characters (each becomes "?"). */
-// eslint-disable-next-line no-control-regex
-const printable = (text) => text.replace(/[\u0000-\u001f\u007f]/g, '?');
-
 /** Only `true` (or the text "true") allows: anything else, missing included, refuses. */
 const strictTrue = (value) => value === true || value === 'true';
 
@@ -85,8 +81,11 @@ export function normalizeConfig(raw = {}) {
   return {
     /** Undefined when the address or the unit id is invalid: nothing is read nor sent. */
     address: unitIdValid ? address : undefined,
-    /** What was typed, when it is not a valid address (shown in the status, without control characters). */
-    invalid: typed !== '' && !address ? printable(typed.slice(0, 60)) : undefined,
+    /**
+     * The length of what was typed, when it is not a valid address: the text
+     * itself is never shown again (a key may have been pasted there by mistake).
+     */
+    invalid: typed !== '' && !address ? typed.length : undefined,
     /** The Modbus unit id; an invalid one is refused, never replaced by a guess. */
     unitId: unitIdValid ? unitId : undefined,
     badUnitId: !unitIdValid,
